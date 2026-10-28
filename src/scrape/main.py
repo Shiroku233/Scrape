@@ -1,4 +1,4 @@
-from steam_annual_top_game.steam_annual_top_game import run
+from steam_top_game_releases.steam_top_game_releases import run
 
 
 def main():
