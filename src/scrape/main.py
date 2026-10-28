@@ -1,4 +1,4 @@
-from scrape.douban_top250_movies import run
+from steam_annual_top_game.steam_annual_top_game import run
 
 
 def main():
