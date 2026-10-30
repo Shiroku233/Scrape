@@ -15,8 +15,8 @@ def run():
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     }
-
     session = create_session()
+
     months = get_all_months(session)
 
     results = []

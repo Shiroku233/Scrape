@@ -1,4 +1,4 @@
-from steam_top_game_releases.steam_top_game_releases import run
+from app_users_comment.app_users_comment import run
 
 
 def main():
