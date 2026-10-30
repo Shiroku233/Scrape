@@ -1,50 +1,86 @@
 import hashlib
+import random
 import time
 import urllib
 from functools import reduce
+from pathlib import Path
 
-
-from scrape.supporting import create_session, clean_url
+from scrape.supporting import create_session, clean_url, save_csv
 
 
 def run():
     session = create_session()
-
-    #获取一次密钥，整个运行期复用
-    img_key, sub_key = get_wbi_key(session)
-    mixin_key = get_mixin_key(img_key, sub_key)
-    print(f"mixin_key: {mixin_key}")
-
-
-    url ="https://api.bilibili.com/x/v2/reply/wbi/main"
-    headers=get_headers()
-    params = {
-        "oid": 0,  #
-        "type": 1,
-        "mode": 3,
-        "pagination_str": '{"offset":""}',
-        "plat": 1,
-        "web_location": 0,  #
-        "seek_rpid": "",
-    }
-
 
     # 获取一次密钥，整个运行期复用
     img_key, sub_key = get_wbi_key(session)
     mixin_key = get_mixin_key(img_key, sub_key)
     print(f"mixin_key: {mixin_key}")
 
-    #签名
-    signed = enc_wbi(params, mixin_key)
+    results=fetch_all_replies(mixin_key,session)
 
-    response=session.get(url,params=signed,headers=headers,timeout=10)
-    print(response.status_code)
-    raw_data=response.json()
-    print(raw_data)
+    file = Path(__file__).stem
+    save_csv(results, file)
+
+
+
+
+def fetch_all_replies(mixin_key,session):
+
+    url = "https://api.bilibili.com/x/v2/reply/wbi/main"
+    headers = get_headers()
+
+    next_offset=""
+    page=0
+    all_replies=[]
+    while True:
+        page+=1
+        params = {
+            "oid": 0,  #
+            "type": 1,
+            "mode": 3,
+            "pagination_str": '{"offset":"%s"}'%next_offset,
+            "plat": 1,
+            "web_location": 0,  #
+        }
+
+        if next_offset=="":  #首页：next_offset为空
+            params["seek_rpid"] = ""  #增加seek_rpid参数
+
+        #签名
+        signed=enc_wbi(params,mixin_key)
+
+        response = session.get(url, params=signed, headers=headers, timeout=10)
+        data = response.json()
+        if data.get("code")!=0:
+            print(f"第{page}页失败： {data.get('code')} {data.get('message')}")
+            break
+
+        #获取并合并单页数据
+        page_replies = resolve_page_replies(data)
+        all_replies=all_replies+page_replies
+        print(f"第{page}页成功，本页{len(page_replies)} 条，累计 {len(all_replies)} 条")
+
+        #翻页指针
+        next_offset = (
+            data["data"].get("cursor", {})
+            .get("pagination_reply", {})
+            .get("next_offset") or ""
+        )
+
+        #到达最后一页停止
+        if not next_offset or data["data"]["cursor"].get("is_end"):
+            break
+
+        #随机休眠
+        time.sleep(random.uniform(1, 3))
+    return all_replies
 
 
 def get_headers():
-    with open('bili_cookie.txt', 'r') as f:
+    """根据指定cookie获取请求头"""
+    dir=Path(__file__).resolve().parent
+    cookie_path=dir/"bili_cookie.txt"
+    with open(cookie_path, 'r') as f:
         cookie = f.read()
     headers = {
         "Cookie":cookie,
@@ -56,8 +92,29 @@ def get_headers():
     }
     return headers
 
+def resolve_page_replies(data):
+    """解析单页数据"""
+    page_replies = []
 
+    replies = data["data"].get("replies") or []
+    for reply in replies:
+        reply_data = {
+            "name": reply["member"]["uname"],
+            "uid": reply["member"]["mid"],
+            "location": (reply.get("reply_control", {}).get("location") or "")[5:],
+            "level": reply["member"]["level_info"]["current_level"],
 
+            "reply_id": reply["rpid"],
+            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(reply["ctime"])),
+            "message": reply["content"]["message"],
+            "like": reply["like"],
+            "sub_count": reply.get("rcount",0),
+        }
+        # print(reply_data)
+        page_replies.append(reply_data)
+    return page_replies
+
+#----获取wts和w_rid算法----
 MIXIN_KEY_ENC_TAB = [
     46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
     33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40,
