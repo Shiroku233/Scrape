@@ -1,46 +1,81 @@
 import hashlib
+import json
 import random
+import re
 import time
 import urllib
 from functools import reduce
 from pathlib import Path
 
-from scrape.supporting import create_session, clean_url, save_csv
+from scrape.supporting import create_session, save_csv
 
+class Config:
+    def __init__(self):
+        dir = Path(__file__).resolve().parent
+        config_path = dir / "config.json"
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        self.bv = config["bv"]
+        self.cookie = config["cookie"]
+
+
+
+    def get_headers(self):
+        """根据指定cookie获取请求头"""
+        headers = {
+            "Cookie": self.cookie,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/120.0.0.0 Safari/537.36 Edg/146.0.0.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+        return headers
 
 def run():
     session = create_session()
 
+    # 获取配置
+    config = Config()
+
     # 获取一次密钥，整个运行期复用
-    img_key, sub_key = get_wbi_key(session)
+    img_key, sub_key = get_wbi_key(session,config)
     mixin_key = get_mixin_key(img_key, sub_key)
     print(f"mixin_key: {mixin_key}")
 
-    results=fetch_all_replies(mixin_key,session)
+    oid = get_oid(config, session)
+
+    #获取数据
+    results=fetch_all_replies(mixin_key,oid,session,config)
 
     file = Path(__file__).stem
     save_csv(results, file)
 
 
 
-
-def fetch_all_replies(mixin_key,session):
+def fetch_all_replies(mixin_key,oid,session,config):
 
     url = "https://api.bilibili.com/x/v2/reply/wbi/main"
-    headers = get_headers()
+    headers = config.get_headers()
 
     next_offset=""
     page=0
+
+    # 风控：每爬10~15页评论停20~30秒
+    stop=0
+    stop_page=random.randint(10,15)
+
     all_replies=[]
     while True:
         page+=1
+
         params = {
-            "oid": 0,  #
+            "oid": oid,  #
             "type": 1,
             "mode": 3,
             "pagination_str": '{"offset":"%s"}'%next_offset,
             "plat": 1,
-            "web_location": 0,  #
+            "web_location": 1315875,
         }
 
         if next_offset=="":  #首页：next_offset为空
@@ -49,6 +84,7 @@ def fetch_all_replies(mixin_key,session):
         #签名
         signed=enc_wbi(params,mixin_key)
 
+        #解析
         response = session.get(url, params=signed, headers=headers, timeout=10)
         data = response.json()
         if data.get("code")!=0:
@@ -59,6 +95,15 @@ def fetch_all_replies(mixin_key,session):
         page_replies = resolve_page_replies(data)
         all_replies=all_replies+page_replies
         print(f"第{page}页成功，本页{len(page_replies)} 条，累计 {len(all_replies)} 条")
+
+        #风控
+        stop += 1
+        if stop >= stop_page:
+            pause = random.uniform(20, 30)
+            print(f"已连续爬 {stop} 页，暂停 {pause:.1f} 秒...")
+            time.sleep(pause)
+            stop = 0
+            stop_page = random.randint(10, 15)
 
         #翻页指针
         next_offset = (
@@ -76,43 +121,62 @@ def fetch_all_replies(mixin_key,session):
     return all_replies
 
 
-def get_headers():
-    """根据指定cookie获取请求头"""
-    dir=Path(__file__).resolve().parent
-    cookie_path=dir/"bili_cookie.txt"
-    with open(cookie_path, 'r') as f:
-        cookie = f.read()
-    headers = {
-        "Cookie":cookie,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/120.0.0.0 Safari/537.36 Edg/146.0.0.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    }
-    return headers
+
+
+def get_oid(config,session):
+    """通过 BV 号获取视频的 aid(oid)"""
+    bv=config.bv
+    url = f"https://www.bilibili.com/video/{bv}"
+    response = session.get(url, headers=config.get_headers(), timeout=10)
+    response.encoding = "utf-8"
+    res = re.search(r'"aid":(\d+),"bvid":"' + re.escape(bv) + '"', response.text)
+    if res:
+        return int(res.group(1))
+
+    # 兜底：有些页面格式略有不同，直接找 aid
+    res = re.search(r'"aid":(\d+)', response.text)
+    if res:
+        return int(res.group(1))
+
+    raise ValueError(f"无法从 {bv} 解析出 oid，请检查 BV 号是否正确")
 
 def resolve_page_replies(data):
     """解析单页数据"""
     page_replies = []
 
-    replies = data["data"].get("replies") or []
+    is_first_page = data["data"]["cursor"].get("is_begin")
+    replies = list(data["data"].get("replies") or [])
+
+    #检查补充置顶/管理员评论
+    if is_first_page:
+        top = data["data"].get("top") or {}
+        for key in ("upper", "admin"):
+            top_reply=top.get(key)
+            if top_reply and isinstance(top_reply, dict) and top_reply.get("rpid"):
+                replies.insert(0, top_reply)  # 置顶放最前
+
+
     for reply in replies:
+        pictures=reply.get("content",{}).get("pictures") or []
         reply_data = {
             "name": reply["member"]["uname"],
             "uid": reply["member"]["mid"],
             "location": (reply.get("reply_control", {}).get("location") or "")[5:],
             "level": reply["member"]["level_info"]["current_level"],
 
-            "reply_id": reply["rpid"],
+            "reply_id": reply.get("rpid"),
             "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(reply["ctime"])),
             "message": reply["content"]["message"],
             "like": reply["like"],
             "sub_count": reply.get("rcount",0),
+
+            "images": ",".join(p.get("img_src", "") for p in pictures if p.get("img_src")),
         }
         # print(reply_data)
         page_replies.append(reply_data)
     return page_replies
+
+
 
 #----获取wts和w_rid算法----
 MIXIN_KEY_ENC_TAB = [
@@ -124,9 +188,10 @@ MIXIN_KEY_ENC_TAB = [
 
 
 
-def get_wbi_key(session):
+def get_wbi_key(session,config):
     """从 nav 接口获取当天的 img_key 和 sub_key"""
-    response=session.get("https://api.bilibili.com/x/web-interface/nav",headers=get_headers())
+    url="https://api.bilibili.com/x/web-interface/nav"
+    response=session.get(url,headers=config.get_headers(),timeout=10)
     data=response.json()["data"]["wbi_img"]
 
     img_url=data["img_url"]
