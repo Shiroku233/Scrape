@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import random
 import re
 import time
@@ -17,7 +18,7 @@ class Config:
             config = json.load(f)
         self.bv = config["bv"]
         self.cookie = config["cookie"]
-
+        self.fetch_sub=config["fetch_sub"]
 
 
     def get_headers(self):
@@ -32,6 +33,7 @@ class Config:
         }
         return headers
 
+
 def run():
     session = create_session()
 
@@ -43,20 +45,33 @@ def run():
     mixin_key = get_mixin_key(img_key, sub_key)
     print(f"mixin_key: {mixin_key}")
 
-    oid = get_oid(config, session)
+    all_replies = []
 
-    #获取数据
-    results=fetch_all_replies(mixin_key,oid,session,config)
+    #获取主评论
+    main_replies = fetch_main_replies(mixin_key, session, config)
+    all_replies.extend(main_replies)
 
+    #获取楼中楼
+    if config.fetch_sub:
+        for i in range(len(main_replies)):
+            main=main_replies[i]
+            #对应主评论存在楼中楼才获取
+            if main.get("sub_count", 0) > 0:
+                print(f"第{i+1}条主评论，存在楼中楼")
+                sub_replies = fetch_sub_replies(main,session, config)
+                all_replies.extend(sub_replies)
+
+    print(f"获取完成，共{len(all_replies)}条评论")
     file = Path(__file__).stem
-    save_csv(results, file)
+    save_csv(all_replies, file)
 
 
 
-def fetch_all_replies(mixin_key,oid,session,config):
+def fetch_main_replies(mixin_key,session,config):
 
     url = "https://api.bilibili.com/x/v2/reply/wbi/main"
     headers = config.get_headers()
+    oid = get_oid(config, session)
 
     next_offset=""
     page=0
@@ -65,10 +80,12 @@ def fetch_all_replies(mixin_key,oid,session,config):
     stop=0
     stop_page=random.randint(10,15)
 
-    all_replies=[]
+    main_replies=[]
+    print("----开始获取主评论----")
     while True:
         page+=1
 
+        # 获取参数并签名
         params = {
             "oid": oid,  #
             "type": 1,
@@ -81,26 +98,45 @@ def fetch_all_replies(mixin_key,oid,session,config):
         if next_offset=="":  #首页：next_offset为空
             params["seek_rpid"] = ""  #增加seek_rpid参数
 
-        #签名
         signed=enc_wbi(params,mixin_key)
 
-        #解析
+        #请求
         response = session.get(url, params=signed, headers=headers, timeout=10)
         data = response.json()
         if data.get("code")!=0:
-            print(f"第{page}页失败： {data.get('code')} {data.get('message')}")
+            print(f"[主评论] 第{page}页失败： {data.get('code')} {data.get('message')}")
             break
 
-        #获取并合并单页数据
-        page_replies = resolve_page_replies(data)
-        all_replies=all_replies+page_replies
-        print(f"第{page}页成功，本页{len(page_replies)} 条，累计 {len(all_replies)} 条")
+        # 检查补充置顶/管理员评论
+        if page==1:
+            top = data["data"].get("top") or {}
+            for key in ("upper", "admin"):
+                raw_top_reply = top.get(key)
+                # 置顶评论存在才处理，且置顶放最前
+                if raw_top_reply and isinstance(raw_top_reply, dict) and raw_top_reply.get("rpid"):
+                    top_reply=parse_single_reply(raw_top_reply)
+                    #标记top
+                    top_reply["mark"]="top"
+                    main_replies.append(top_reply)
+                    print(f"[置顶评论] 存在 添加成功")
+
+        #获取并合并单页评论
+        page_replies = []
+        raw_replies = list(data["data"].get("replies") or [])
+        for reply in raw_replies:
+            main = parse_single_reply(reply)
+            # 标记主评论
+            if not main.get("mark"):
+                main["mark"] = "main"
+            page_replies.append(main)
+        main_replies+=page_replies
+        print(f"[主评论] 第{page}页成功，本页{len(page_replies)} 条，累计 {len(main_replies)} 条")
 
         #风控
         stop += 1
         if stop >= stop_page:
             pause = random.uniform(20, 30)
-            print(f"已连续爬 {stop} 页，暂停 {pause:.1f} 秒...")
+            print(f"[风控] 已连续爬 {stop} 页，暂停 {pause:.1f} 秒...")
             time.sleep(pause)
             stop = 0
             stop_page = random.randint(10, 15)
@@ -118,9 +154,63 @@ def fetch_all_replies(mixin_key,oid,session,config):
 
         #随机休眠
         time.sleep(random.uniform(1, 3))
-    return all_replies
+    return main_replies
 
+def fetch_sub_replies(main,session,config):
 
+    url = "https://api.bilibili.com/x/v2/reply/reply"
+    headers=config.get_headers()
+    oid = get_oid(config, session)
+
+    page=0
+    sub_pages = math.ceil(main["sub_count"] / 20)
+
+    # 风控：每爬5~8页评论停10~15秒
+    stop = 0
+    stop_page = random.randint(5, 8)
+
+    sub_replies=[]
+    print("----开始获取楼中楼----")
+    while page<sub_pages:
+        page+=1
+        params = {
+            "oid": oid,  #
+            "type": 1,
+            "root": main.get("reply_id"),
+            "ps": 20,
+            "pn": page
+        }
+
+        # 请求
+        response = session.get(url, params=params, headers=headers, timeout=10)
+        data = response.json()
+        if data.get("code") != 0:
+            print(f"[楼中楼] 第{page}页失败： {data.get('code')} {data.get('message')}")
+            break
+
+        #获取并合并楼中楼单页评论
+        page_replies = []
+        raw_replies = list(data["data"].get("replies") or [])
+        for reply in raw_replies:
+            sub=parse_single_reply(reply)
+            # 标记楼中楼
+            if not sub.get("mark"):
+                sub["mark"] = "main"
+            page_replies.append(sub)
+        sub_replies += page_replies
+        print(f"[楼中楼] 第{page}页成功，本页{len(page_replies)} 条，累计 {len(sub_replies)} 条")
+        # 风控
+        stop += 1
+        if stop >= stop_page:
+            pause = random.uniform(10, 15)
+            print(f"[风控] 已连续爬 {stop} 页，暂停 {pause:.1f} 秒...")
+            time.sleep(pause)
+            stop = 0
+            stop_page = random.randint(5, 8)
+
+        # 随机休眠
+        time.sleep(random.uniform(1, 3))
+    return sub_replies
 
 
 def get_oid(config,session):
@@ -140,41 +230,26 @@ def get_oid(config,session):
 
     raise ValueError(f"无法从 {bv} 解析出 oid，请检查 BV 号是否正确")
 
-def resolve_page_replies(data):
-    """解析单页数据"""
-    page_replies = []
+def parse_single_reply(reply):
+    pictures = reply.get("content", {}).get("pictures") or []
+    reply_data = {
+        "name": reply["member"]["uname"],
+        "uid": reply["member"]["mid"],
+        "location": (reply.get("reply_control", {}).get("location") or "")[5:],
+        "level": reply["member"]["level_info"]["current_level"],
 
-    is_first_page = data["data"]["cursor"].get("is_begin")
-    replies = list(data["data"].get("replies") or [])
+        "reply_id": reply.get("rpid_str") or str(reply.get("rpid")),
+        "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(reply["ctime"])),
+        "message": reply["content"]["message"],
+        "like": reply["like"],
 
-    #检查补充置顶/管理员评论
-    if is_first_page:
-        top = data["data"].get("top") or {}
-        for key in ("upper", "admin"):
-            top_reply=top.get(key)
-            if top_reply and isinstance(top_reply, dict) and top_reply.get("rpid"):
-                replies.insert(0, top_reply)  # 置顶放最前
+        "root": reply.get("root", 0),
+        "sub_count": reply.get("rcount", 0),
 
-
-    for reply in replies:
-        pictures=reply.get("content",{}).get("pictures") or []
-        reply_data = {
-            "name": reply["member"]["uname"],
-            "uid": reply["member"]["mid"],
-            "location": (reply.get("reply_control", {}).get("location") or "")[5:],
-            "level": reply["member"]["level_info"]["current_level"],
-
-            "reply_id": reply.get("rpid"),
-            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(reply["ctime"])),
-            "message": reply["content"]["message"],
-            "like": reply["like"],
-            "sub_count": reply.get("rcount",0),
-
-            "images": ",".join(p.get("img_src", "") for p in pictures if p.get("img_src")),
-        }
-        # print(reply_data)
-        page_replies.append(reply_data)
-    return page_replies
+        "images": ",".join(p.get("img_src", "") for p in pictures if p.get("img_src")),
+    }
+    # print(reply_data)
+    return reply_data
 
 
 
@@ -185,8 +260,6 @@ MIXIN_KEY_ENC_TAB = [
     61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11,
     36, 20, 34, 44, 52
 ]
-
-
 
 def get_wbi_key(session,config):
     """从 nav 接口获取当天的 img_key 和 sub_key"""
@@ -200,7 +273,6 @@ def get_wbi_key(session,config):
     sub_key=sub_url.rsplit("/",1)[-1].split(".")[0]
 
     return img_key,sub_key
-
 
 def get_mixin_key(img_key,sub_key):
     """拼接并重排，取前32位作为签名密钥"""
