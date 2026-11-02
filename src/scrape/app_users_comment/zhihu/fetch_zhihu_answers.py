@@ -24,14 +24,11 @@ def run():
     config = Config()
     if config.content_type not in CONTENT_TYPE:
         raise ValueError(f"config.json 的 content_type 必须是 {CONTENT_TYPE} 之一，当前是 {config.content_type}")
-
+    if not config.question_id:
+        raise ValueError(f"config的question格式不支持")
     cp=ChromiumPage()  #打开浏览器
-
     cp.listen.start(f"/api/v4/questions/{config.question_id}/feeds")  # 开启数据包监听
-
     cp.get(f"https://www.zhihu.com/question/{config.question_id}")  #打开网页
-
-
 
     all_answers = []
 
@@ -39,13 +36,20 @@ def run():
         # 滚动到屏幕最底端
         cp.scroll.to_bottom()
         # 直接滚动到底部容易出现懒加载超时问题，到底后小幅上翻再下翻，补充触发懒加载
-        cp.run_js("window.scrollBy(0, -300)")
-        time.sleep(0.4)
-        cp.run_js("window.scrollBy(0, 800)")
-        time.sleep(0.5)
+        last_height = cp.run_js("return document.body.scrollHeight")
+        for _ in range(5):  # 最多补滚5次
+            cp.scroll.to_bottom()
+            cp.run_js("window.scrollBy(0, -300)")
+            time.sleep(0.4)
+            cp.run_js("window.scrollBy(0, 800)")
+            time.sleep(0.6)
+            new_height = cp.run_js("return document.body.scrollHeight")
+            if new_height != last_height:
+                break
+            last_height = new_height
 
         # 等待数据包加载完毕
-        response = cp.listen.wait(timeout=15)
+        response = cp.listen.wait(timeout=20)
         if not response:
             print("等待超时，停止")
             break
