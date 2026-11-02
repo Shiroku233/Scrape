@@ -8,7 +8,8 @@ import urllib
 from functools import reduce
 from pathlib import Path
 
-from scrape.supporting import create_session, save_csv
+from scrape.supporting import create_session, save_csv, convert_time
+
 
 class Config:
     def __init__(self):
@@ -195,7 +196,7 @@ def fetch_sub_replies(main,session,config):
             sub=parse_single_reply(reply)
             # 标记楼中楼
             if not sub.get("mark"):
-                sub["mark"] = "main"
+                sub["mark"] = "sub"
             page_replies.append(sub)
         sub_replies += page_replies
         print(f"[楼中楼] 第{page}页成功，本页{len(page_replies)} 条，累计 {len(sub_replies)} 条")
@@ -212,6 +213,26 @@ def fetch_sub_replies(main,session,config):
         time.sleep(random.uniform(1, 3))
     return sub_replies
 
+def parse_single_reply(reply):
+    pictures = reply.get("content", {}).get("pictures") or []
+    reply_data = {
+        "name": reply["member"]["uname"],
+        "uid": reply["member"]["mid"],
+        "location": (reply.get("reply_control", {}).get("location") or "")[5:],
+        "level": reply["member"]["level_info"]["current_level"],
+
+        "reply_id": reply.get("rpid_str") or str(reply.get("rpid")),
+        "time": convert_time(reply["ctime"]),
+        "message": reply["content"]["message"],
+        "like": reply["like"],
+
+        "root": reply.get("root", 0),
+        "sub_count": reply.get("rcount", 0),
+
+        "images": ",".join(p.get("img_src", "") for p in pictures if p.get("img_src")),
+    }
+    # print(reply_data)
+    return reply_data
 
 def get_oid(config,session):
     """通过 BV 号获取视频的 aid(oid)"""
@@ -229,28 +250,6 @@ def get_oid(config,session):
         return int(res.group(1))
 
     raise ValueError(f"无法从 {bv} 解析出 oid，请检查 BV 号是否正确")
-
-def parse_single_reply(reply):
-    pictures = reply.get("content", {}).get("pictures") or []
-    reply_data = {
-        "name": reply["member"]["uname"],
-        "uid": reply["member"]["mid"],
-        "location": (reply.get("reply_control", {}).get("location") or "")[5:],
-        "level": reply["member"]["level_info"]["current_level"],
-
-        "reply_id": reply.get("rpid_str") or str(reply.get("rpid")),
-        "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(reply["ctime"])),
-        "message": reply["content"]["message"],
-        "like": reply["like"],
-
-        "root": reply.get("root", 0),
-        "sub_count": reply.get("rcount", 0),
-
-        "images": ",".join(p.get("img_src", "") for p in pictures if p.get("img_src")),
-    }
-    # print(reply_data)
-    return reply_data
-
 
 
 #----获取wts和w_rid算法----

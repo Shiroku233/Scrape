@@ -1,4 +1,4 @@
-from app_users_comment.app_users_comment import run
+from scrape.app_users_comment.zhihu.fetch_zhihu_answers import run
 
 
 def main():
