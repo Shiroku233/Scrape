@@ -2,7 +2,7 @@ import json
 import time
 from pathlib import Path
 
-from DrissionPage import ChromiumPage
+from DrissionPage import ChromiumPage,WebPage
 from DrissionRecord import Recorder
 
 from scrape.supporting import convert_time, html_to_txt, html_to_md
@@ -26,12 +26,29 @@ def run():
         raise ValueError(f"config.json 的 content_type 必须是 {CONTENT_TYPE} 之一，当前是 {config.content_type}")
     if not config.question_id:
         raise ValueError(f"config的question格式不支持")
-    cp=ChromiumPage()  #打开浏览器
-    cp.listen.start(f"/api/v4/questions/{config.question_id}/feeds")  # 开启数据包监听
-    cp.get(f"https://www.zhihu.com/question/{config.question_id}")  #打开网页
 
     all_answers = []
+    fetch_first_page(config,all_answers)
+    fetch_pages_answers(config,all_answers)
 
+    #去重
+    results=deduped(all_answers)
+
+    save_path=Path(__file__).parent/"zhihu_answers.csv"
+    r = Recorder(save_path)
+    r.add_data(results)
+    r.record()
+
+
+
+def fetch_pages_answers(config,all_answers):
+    cp = ChromiumPage()  # 打开浏览器
+    cp.listen.start(f"/api/v4/questions/{config.question_id}/feeds")  # 开启数据包监听
+
+    url=f"https://www.zhihu.com/question/{config.question_id}"
+    cp.get(url)  # 打开网页
+
+    print("----开始获取主要页面回答----")
     while True:
         # 滚动到屏幕最底端
         cp.scroll.to_bottom()
@@ -56,34 +73,63 @@ def run():
 
         raw = response.response.body
 
-        data = raw.get("data",{})
+        data = raw.get("data", {})
         paging = raw.get("paging") or {}
 
-        #尾页停止
-        if paging.get("is_end",True):
+        # 尾页停止
+        if paging.get("is_end", True):
             break
 
-        page=paging.get("page","?")
+        page = paging.get("page", "?")
         page_answers = []
 
         for answer in data:
-            page_answers.append(parse_single_answer(answer,config))
+            page_answers.append(parse_single_answer(answer, config))
         if not page_answers:
             print("本页无数据，停止")
             break
 
-        all_answers += page_answers
+        all_answers.extend(page_answers)
         print(f"第{page}页完成，本页{len(page_answers)}条，共{len(all_answers)}条")
+    # cp.quit()
 
 
 
-    save_path=Path(__file__).parent/"zhihu_answers.csv"
-    r = Recorder(save_path)
-    r.add_data(all_answers)
-    r.record()
+def fetch_first_page(config,all_answers):
+    """首页数据地址与常规页面不同，需要特殊处理"""
 
-    cp.quit()
+    wp = WebPage()  # 用 WebPage 打开浏览器
+    wp.get(f"https://www.zhihu.com/question/{config.question_id}")
+    wp.change_mode()  # 切换为请求模式，此时 wp.get 发出的请求能自动带上浏览器的 Cookie
 
+    # 构造第一页请求（offset=0）
+    url = f"https://www.zhihu.com/api/v4/questions/{config.question_id}/answers"
+    params = {
+        "include": "data[*].content,excerpt,author.name,created_time,voteup_count",
+        "limit": 20,  # limit设大一点，减少后续请求次数
+        "offset": 0,
+        "platform": "desktop",
+        "sort_by": "default",
+    }
+    ok = wp.get(url, params=params)
+    if not ok:
+        print("请求失败，可能被风控或未登录")
+        wp.quit()
+        return False
+
+    raw = wp.json
+    data = raw.get("data", {})
+    wp.quit()  # 关闭这个临时页面
+
+    print("----开始获取第一页回答----")
+    # 解析第一页answers
+    first_answers = []
+    for answer in data:
+        first_answers.append(parse_single_answer(answer, config))
+
+    all_answers.extend(first_answers)
+    print(f"第1页完成，本页{len(first_answers)}条，共{len(all_answers)}条")
+    return True
 
 
 def parse_single_answer(answer,config):
@@ -115,3 +161,15 @@ def parse_single_answer(answer,config):
     }
     return answer_data
 
+def deduped(all_answers):
+    seen = set()
+    deduped_answers = []
+    print("----开始去重----")
+    for answer in all_answers:
+        aid = answer.get("answer_id")
+        if aid is None or aid in seen:
+            continue
+        seen.add(aid)
+        deduped_answers.append(answer)
+    print(f"去重前 {len(all_answers)} 条，去重后 {len(deduped_answers)} 条，移除 {len(all_answers) - len(deduped_answers)} 条重复")
+    return deduped_answers
